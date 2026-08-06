@@ -175,7 +175,14 @@ class SenderWorker(Worker):
 
     # Sync Tests
     def test_send_object(self, async_op=False):
-        return self._send_data({"message": f"Hello from rank {self._rank}"}, async_op)
+        observation = {
+            "obs": {
+                "state": torch.tensor([self._rank], dtype=torch.float32),
+                "task": f"rank_{self._rank}",
+            },
+            "final_obs": None,
+        }
+        return self._send_data(observation, async_op)
 
     def test_send_plain_dataclass(self, async_op=False):
         msg = PlainMessage(
@@ -1087,7 +1094,11 @@ class TestCommunication:
         )
         for i, res in enumerate(results):
             peer_rank = get_recv_peer_rank(i, len(results))
-            assert res == {"message": f"Hello from rank {peer_rank}"}
+            assert res["obs"]["task"] == f"rank_{peer_rank}"
+            assert torch.equal(
+                res["obs"]["state"], torch.tensor([peer_rank], dtype=torch.float32)
+            )
+            assert res["final_obs"] is None
 
     @pytest.mark.parametrize("async_op", [False, True], ids=["sync", "async_wait"])
     def test_plain_dataclass_communication(self, worker_groups, async_op):

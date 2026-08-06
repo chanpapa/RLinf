@@ -203,6 +203,7 @@ class CollectiveGroup:
     TENSOR_DICT: int = 2
     OBJECT: int = 3
     DATACLASS_WITH_TENSORS: int = 4
+    PACKED_OBJECT: int = 5
     POOL_SIZE: int = 1
 
     def __init__(
@@ -302,6 +303,8 @@ class CollectiveGroup:
         # Because the _atomic_send and all the send in the way may be called asynchronously while the channel_id in the class may be different.
         send_comm_id = next(self._send_comm_id_iter)
         object_type, tensor_data = self._get_object_info(object)
+        if self._should_pack_generic_object(object_type, tensor_data):
+            object_type = CollectiveGroup.PACKED_OBJECT
 
         # Create AsyncFuncWork for the send operation
         send_work = AsyncFuncWork(
@@ -350,14 +353,31 @@ class CollectiveGroup:
         It runs in an atomic way, i.e., communications of two calls of _atomic_send are guaranteed to be in the same ordered as the send API is called.
         """
         self._init_process_group(options=options)
-        # First send object type to the destination worker
-        object_type_tensor = torch.tensor(object_type, dtype=torch.int, device="cpu")
-        self._send(object_type_tensor, CollectiveGroup.CPU, comm_id)
+        packed_tensor = None
+        packed_size = -1
+        if object_type == CollectiveGroup.PACKED_OBJECT:
+            packed_tensor, packed_size_tensor = self._object_to_tensor(
+                (object, piggyback_payload), "cpu"
+            )
+            packed_size = packed_size_tensor.item()
+
+        wire_header = torch.tensor(
+            [object_type, packed_size], dtype=torch.long, device="cpu"
+        )
+        self._send(wire_header, CollectiveGroup.CPU, comm_id)
         self._logger.debug(
             f"Sending object type {object_type} from {self._cur_worker_address.get_name()} in group {self._group_info.group_name}"
         )
 
-        if object_type == CollectiveGroup.TENSOR:
+        if object_type == CollectiveGroup.PACKED_OBJECT:
+            with self._track_payload_time(work=work):
+                packed_work = self._send(
+                    packed_tensor,
+                    device=CollectiveGroup.CPU,
+                    comm_id=comm_id,
+                )
+            return packed_work
+        elif object_type == CollectiveGroup.TENSOR:
             # Out-of-place tensor send/recv is done via tensor list send/recv with a list of one tensor
             return self._send_tensor_list(
                 [object],
@@ -463,15 +483,19 @@ class CollectiveGroup:
 
         self._init_process_group(options=options)
 
-        # First recv object type
-        object_type_tensor = torch.empty(1, dtype=torch.int, device="cpu")
-        self._recv(object_type_tensor, CollectiveGroup.CPU, comm_id)
+        wire_header = torch.empty(2, dtype=torch.long, device="cpu")
+        self._recv(wire_header, CollectiveGroup.CPU, comm_id)
 
-        object_type = object_type_tensor.item()
+        object_type, packed_size = wire_header.tolist()
         self._logger.debug(
             f"Receiving object type {object_type} from Rank {self._peer_rank} in group {self._group_info.group_name}"
         )
-        if object_type == CollectiveGroup.TENSOR:
+        if object_type == CollectiveGroup.PACKED_OBJECT:
+            packed_tensor = torch.empty(packed_size, dtype=torch.uint8, device="cpu")
+            with self._track_payload_time(work=work):
+                self._recv(packed_tensor, CollectiveGroup.CPU, comm_id)
+            data, pb_data = self._tensor_to_object(packed_tensor, packed_size)
+        elif object_type == CollectiveGroup.TENSOR:
             tensor, pb_data = self._recv_tensor_list(comm_id, work=work)
             assert len(tensor) == 1, (
                 f"Expected to receive one tensor but got {len(tensor)} tensors from Rank {self._peer_rank} in group {self._group_info.group_name}"
@@ -1374,6 +1398,16 @@ class CollectiveGroup:
                 )
 
         return object_type, tensor_data
+
+    def _should_pack_generic_object(
+        self, object_type: int, tensor_data: TensorData
+    ) -> bool:
+        """Return whether generic send should use the packed CPU object protocol."""
+        return object_type == CollectiveGroup.OBJECT or (
+            object_type
+            in (CollectiveGroup.TENSOR, CollectiveGroup.DATACLASS_WITH_TENSORS)
+            and not tensor_data.has_accel_tensor
+        )
 
     def _check_tensor_contiguous(self, tensors: Iterable[torch.Tensor]):
         """Check if the tensors are contiguous."""
