@@ -2270,6 +2270,7 @@ def test_async_runner_reuses_decoupled_evaluation_service_across_validations():
     runner.cfg = OmegaConf.create({"runner": {"enable_decoupled_mode": True}})
     runner.env_channel = Mock()
     runner.rollout_channel = Mock()
+    runner.eval_rollout_channel = runner.rollout_channel
     runner.rollout = Mock()
     runner.rollout.ensure_evaluate_service.return_value = Mock(
         wait=Mock(return_value=None)

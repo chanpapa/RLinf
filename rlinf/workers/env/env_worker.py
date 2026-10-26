@@ -20,6 +20,12 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from rlinf.data.schema.embodied_sharding import (
+    EPOCH_END_KEY,
+    ShardEpochEnd,
+    action_key,
+    sharding_enabled,
+)
 from rlinf.data.schema.embodied_types import (
     EnvOutput,
     EnvPart,
@@ -52,11 +58,13 @@ class EnvWorker(Worker):
     _obs_split_fn = None
     _policy_input_split_fn = None
     collect_final_values = True
+    enable_sharding = False
 
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
 
         self.cfg = cfg
+        self.enable_sharding = sharding_enabled(cfg)
         self.train_video_cnt = 0
         self.eval_video_cnt = 0
         self.should_stop = False
@@ -196,11 +204,12 @@ class EnvWorker(Worker):
             # Init the batch_router for env decoupled mode
             # The batch_router is a dictionary that maps the tag to the list of batch_index.
             self.batch_router = {}
-            assert self._component_placement.get_world_size(
-                "env"
-            ) >= self._component_placement.get_world_size("rollout"), (
-                "the world size of env must be greater than the world size of rollout in env_decoupled_mode"
-            )
+            if not self.enable_sharding:
+                assert self._component_placement.get_world_size(
+                    "env"
+                ) >= self._component_placement.get_world_size("rollout"), (
+                    "the world size of env must be greater than the world size of rollout in env_decoupled_mode"
+                )
 
     def set_global_step(self, global_step: int) -> None:
         """Set the trajectory step used to correlate distributed events."""
@@ -867,6 +876,15 @@ class EnvWorker(Worker):
             policy_input.sources = [
                 TrajectorySource(key=key, size=self.train_num_envs_per_stage)
             ]
+        if self.enable_sharding:
+            if policy_input.is_last:
+                policy_input.sources = policy_input.env_parts[0].sources
+            if self._policy_input_split_fn is not None:
+                policy_input = self._policy_input_split_fn(
+                    policy_input, [self.train_num_envs_per_stage]
+                )[0]
+            rollout_channel.put(policy_input)
+            return
         self.send_to(
             group_name=self.cfg.rollout.group_name,
             channel=rollout_channel,
@@ -955,7 +973,7 @@ class EnvWorker(Worker):
         )
         policy_input.env_parts = [env_part]
         policy_input.is_last = is_last
-        if is_last and self.env_decoupled_mode:
+        if is_last and self.env_decoupled_mode and not self.enable_sharding:
             return env_part
         self._send_policy_input(
             rollout_channel,
@@ -1133,7 +1151,13 @@ class EnvWorker(Worker):
                     if cooperative_yield:
                         await asyncio.sleep(0)
 
-                    actions = self._recv_actions(input_channel, stage_id)
+                    if self.enable_sharding:
+                        delivery = await rollout_channel.get(
+                            key=action_key(stage_id), async_op=True
+                        ).async_wait()
+                        actions = delivery.payload
+                    else:
+                        actions = self._recv_actions(input_channel, stage_id)
                     self.smooth_intervene.remember_actions(stage_id, actions)
 
                     env_output, env_info, chunk_step_data = self.env_interact_step(
@@ -1204,10 +1228,17 @@ class EnvWorker(Worker):
                     if should_record:
                         self.record_env_metrics(env_metrics, env_info)
 
+            if self.enable_sharding:
+                delivery = await rollout_channel.get(
+                    key=EPOCH_END_KEY, async_op=True
+                ).async_wait()
+                end = delivery.payload
+                if end != ShardEpochEnd(self._trajectory_step, epoch):
+                    raise ValueError(f"Unexpected RoLink epoch completion: {end}")
             self.store_last_obs_and_intervened_info(env_outputs)
             self.finish_rollout()
         self._trajectory_step += 1
-        if self.env_decoupled_mode:
+        if self.env_decoupled_mode and not self.enable_sharding:
             self._prefetched_train_bootstrap = self._bootstrap_and_send_train(
                 rollout_channel,
                 self._trajectory_step,

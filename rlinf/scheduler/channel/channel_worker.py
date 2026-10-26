@@ -270,8 +270,27 @@ class ChannelWorker(Worker):
         # Private per-consumer queues, only used when the dispatcher deals.
         self._deals = self._dispatcher.deals
         self._consumer_queues: dict[str, dict[str, PeekQueue]] = {}
+        self._flush_handle: asyncio.TimerHandle | None = None
 
         self._mem_cleaner_task = asyncio.create_task(self._mem_cleaner())
+
+    def _schedule_collector_flush(self) -> None:
+        """Arm the collector's next deadline without blocking incoming items."""
+        if self._flush_handle is not None:
+            self._flush_handle.cancel()
+            self._flush_handle = None
+        deadline = self._collector.next_flush_at()
+        if deadline is not None:
+            self._flush_handle = asyncio.get_running_loop().call_at(
+                deadline, lambda: asyncio.create_task(self._flush_collector())
+            )
+
+    async def _flush_collector(self) -> None:
+        """Publish timed collector output through the ordinary dispatcher."""
+        output = list(self._collector.flush())
+        self._schedule_collector_flush()
+        for key, item in output:
+            await self._enqueue(key, item, weight=0)
 
     def _consumer_queue(self, key: Any, consumer: str) -> PeekQueue:
         """Return the private queue holding ``key`` items dealt to ``consumer``."""
@@ -451,8 +470,12 @@ class ChannelWorker(Worker):
             nowait (bool): If True, directly raise asyncio.QueueFull if the queue is full. Defaults to False.
 
         """
-        item, (key, weight) = self.recv(src_addr.root_group_name, src_addr.rank_path)
-        for out_key, out_item in iter_collected(self._collector, item, key):
+        item, (key, weight) = await self.recv(
+            src_addr.root_group_name, src_addr.rank_path, async_op=True
+        ).async_wait()
+        output = list(iter_collected(self._collector, item, key))
+        self._schedule_collector_flush()
+        for out_key, out_item in output:
             await self._enqueue(out_key, out_item, weight, nowait=nowait)
 
     async def put_via_ray(
@@ -472,7 +495,9 @@ class ChannelWorker(Worker):
             nowait (bool): If True, directly raise asyncio.QueueFull if the queue is full. Defaults to False.
 
         """
-        for out_key, out_item in iter_collected(self._collector, item, key):
+        output = list(iter_collected(self._collector, item, key))
+        self._schedule_collector_flush()
+        for out_key, out_item in output:
             await self._enqueue(out_key, out_item, weight, nowait=nowait)
 
     async def get(

@@ -1071,10 +1071,321 @@ def _stub_worker(collector=None, dispatcher=None, ctx=None):
     worker._collector.setup(worker._context)
     worker._dispatcher.setup(worker._context)
     worker._deals = worker._dispatcher.deals
+    worker._flush_handle = None
     return worker
 
 
 # --- defaults reproduce today's channel -------------------------------------
+
+
+def test_shard_channel_availability_uniform_routing_and_action_assembly():
+    from rlinf.data.schema.embodied_sharding import (
+        ShardCall,
+        ShardCollector,
+        ShardDispatcher,
+        ShardEpochEnd,
+        ShardResult,
+        ShardTopology,
+    )
+    from rlinf.data.schema.embodied_types import (
+        PolicyInput,
+        TrajectoryKey,
+        TrajectorySource,
+    )
+
+    collector = ShardCollector()
+    collector.setup(
+        ChannelContext(
+            name="shards",
+            options={
+                "topology": ShardTopology(
+                    "env",
+                    (0, 1),
+                    1,
+                    {
+                        "rollout:0": frozenset({0}),
+                        "rollout:1": frozenset(),
+                        "rollout:2": frozenset(),
+                    },
+                ),
+                "min_shard": 1,
+            },
+        )
+    )
+    dispatcher = ShardDispatcher()
+
+    def observe(rank, size, step=0, final=False):
+        item = PolicyInput(
+            obs={"state": torch.arange(size).reshape(-1, 1)},
+            sources=[TrajectorySource(TrajectoryKey(step, 0, rank, 0, 0), size)],
+            is_last=final,
+        )
+        return [delivery for _, delivery in collector.collect(item, "input")]
+
+    def complete(delivery):
+        call = delivery.payload
+        actions = (
+            None if call.policy_input.is_last else call.policy_input.obs["state"] * 10
+        )
+        return [
+            output
+            for _, output in collector.collect(
+                ShardResult(call.call_id, actions), "input"
+            )
+        ]
+
+    assert collector.available_rollouts({0}) == ("rollout:1", "rollout:2")
+    own = observe(0, 64)
+    assert collector.available_rollouts({0}) == ("rollout:1", "rollout:2")
+    assert collector.available_rollouts({1}) == ("rollout:1", "rollout:2")
+    assert [dispatcher.route(d, "inference") for d in own] == [
+        "rollout:0",
+        "rollout:1",
+        "rollout:2",
+    ]
+    assert [len(d.payload.policy_input.obs["state"]) for d in own] == [22, 21, 21]
+    assert sorted(
+        index
+        for d in own
+        for s in d.payload.policy_input.sources
+        for index in range(s.offset, s.offset + s.size)
+    ) == list(range(64))
+
+    local_call = next(d for d in own if d.consumer == "rollout:0")
+    assert complete(local_call) == []
+    # Finishing local inference keeps this GPU reserved while env 0 waits remotely.
+    foreign = observe(1, 3)
+    assert {d.consumer for d in foreign} == {"rollout:1", "rollout:2"}
+    returned = [
+        out for d in reversed(own) if d is not local_call for out in complete(d)
+    ]
+    assert collector.available_rollouts({0}) == ("rollout:1", "rollout:2")
+    assert len(returned) == 1 and returned[0].consumer == "env:0"
+    torch.testing.assert_close(
+        returned[0].payload, torch.arange(64).reshape(-1, 1) * 10
+    )
+
+    # Env 0 can finish and begin its next epoch while env 1 is still running.
+    final_calls = observe(0, 64, final=True)
+    returned = [out for d in reversed(final_calls) for out in complete(d)]
+    assert len(returned) == 1 and returned[0].payload == ShardEpochEnd(0, 0)
+    assert returned[0].consumer == "env:0"
+    next_calls = observe(0, 64, step=1)
+    assert all(isinstance(d.payload, ShardCall) for d in next_calls)
+    assert "rollout:0" in {d.consumer for d in next_calls}
+    returned = [out for d in foreign for out in complete(d)]
+    assert len(returned) == 1 and returned[0].consumer == "env:1"
+    torch.testing.assert_close(returned[0].payload, torch.arange(3).reshape(-1, 1) * 10)
+
+
+def test_shard_channel_batches_requests_and_flushes_after_timeout():
+    from rlinf.data.schema.embodied_sharding import (
+        INFERENCE_KEY,
+        ShardCollector,
+        ShardDispatcher,
+        ShardResult,
+        ShardTopology,
+        action_key,
+    )
+    from rlinf.data.schema.embodied_types import (
+        PolicyInput,
+        TrajectoryKey,
+        TrajectorySource,
+    )
+
+    async def run():
+        worker = _stub_worker(
+            collector=ShardCollector,
+            dispatcher=ShardDispatcher,
+            ctx=ChannelContext(
+                name="batches",
+                options={
+                    "topology": ShardTopology(
+                        "env",
+                        (0, 1, 2),
+                        1,
+                        {
+                            "rollout:0": frozenset({0}),
+                            "rollout:1": frozenset({1}),
+                            "rollout:2": frozenset(),
+                        },
+                    ),
+                    "max_env_requests": 2,
+                    "batch_timeout_ms": 100,
+                },
+            ),
+        )
+
+        async def observe(rank):
+            await worker.put_via_ray(
+                PolicyInput(
+                    obs={"state": torch.arange(3).reshape(-1, 1) + rank * 10},
+                    sources=[TrajectorySource(TrajectoryKey(0, 0, rank, 0, 0), 3)],
+                ),
+                weight=0,
+            )
+
+        async def complete(call):
+            await worker.put_via_ray(
+                ShardResult(call.call_id, call.policy_input.obs["state"] * 10),
+                weight=0,
+            )
+
+        await observe(0)
+        assert worker.qsize(INFERENCE_KEY) == 0
+        await observe(1)
+        calls = [
+            (await worker._take(INFERENCE_KEY, f"rollout:{rank}", True)).item.payload
+            for rank in range(3)
+        ]
+        assert [s.key.env_rank for s in calls[1].policy_input.sources] == [0, 1]
+        assert calls[1].policy_input.request_sizes == [1, 1]
+        assert calls[1].policy_input.env_parts == [None, None]
+
+        started = time.monotonic()
+        await observe(2)
+        assert worker.qsize(INFERENCE_KEY) == 0
+        timed = await asyncio.wait_for(
+            worker._take(INFERENCE_KEY, "rollout:2", False), 1
+        )
+        assert time.monotonic() - started >= 0.09
+        assert worker.qsize(INFERENCE_KEY, "rollout:0") == 0
+        assert worker.qsize(INFERENCE_KEY, "rollout:1") == 0
+
+        await complete(calls[1])
+        await complete(calls[0])
+        a = (await worker._take(action_key(0), "env:0", True)).item.payload
+        torch.testing.assert_close(a, torch.arange(3).reshape(-1, 1) * 10)
+        assert worker.qsize(action_key(0), "env:1") == 0
+        await complete(calls[2])
+        b = (await worker._take(action_key(0), "env:1", True)).item.payload
+        torch.testing.assert_close(b, (torch.arange(3).reshape(-1, 1) + 10) * 10)
+        await complete(timed.item.payload)
+        assert worker.qsize(action_key(0), "env:2") == 1
+        assert worker._flush_handle is None
+
+    asyncio.run(run())
+
+
+def test_shard_channel_profiled_routing_network_queue_and_reassembly(tmp_path):
+    import json
+    from collections import Counter
+
+    from rlinf.data.schema.embodied_routing import LoadAwareRouter
+    from rlinf.data.schema.embodied_sharding import (
+        ShardCollector,
+        ShardResult,
+        ShardTopology,
+    )
+    from rlinf.data.schema.embodied_types import (
+        EnvPart,
+        EnvTransition,
+        PolicyInput,
+        TrajectoryKey,
+        TrajectorySource,
+    )
+
+    path = tmp_path / "profile.json"
+    path.write_text(
+        json.dumps(
+            {
+                "inference": {
+                    "edge": {"time_s": {"1": 1, "8": 8}, "max_batch_size": 32},
+                    "cloud": {"time_s": {"1": 0.2, "8": 1.6}, "max_batch_size": 32},
+                }
+            }
+        )
+    )
+    infos = [
+        SimpleNamespace(
+            address=WorkerAddress("rollout", rank),
+            cluster_node_rank=int(rank > 0),
+            accelerator_model="test_gpu",
+        )
+        for rank in range(3)
+    ]
+
+    def router(bandwidth):
+        return LoadAwareRouter.from_config(
+            {
+                "profile_path": str(path),
+                "profile_by_site": {"edge": "edge", "cloud": "cloud"},
+            },
+            {
+                "sites": {"edge": {"node_ranks": [0]}, "cloud": {"node_ranks": [1]}},
+                "links": [
+                    {
+                        "src": src,
+                        "dst": dst,
+                        "bandwidth_mbps": bandwidth * 8 / 1e6,
+                        "latency_ms": 20,
+                    }
+                    for src, dst in [("edge", "cloud"), ("cloud", "edge")]
+                ],
+            },
+            infos,
+            0,
+        )
+
+    available = ["rollout:0", "rollout:1", "rollout:2"]
+    # Both cloud replicas share the same ten-byte/s link.
+    assert Counter(router(10).assign([1] * 8, [10] * 8, available, 100)) == {
+        "rollout:0": 4,
+        "rollout:1": 2,
+        "rollout:2": 2,
+    }
+    assert router(1).assign([1] * 8, [10] * 8, available, 100) == ["rollout:0"] * 8
+    fast = router(1000)
+    idle = fast.assign([1] * 8, [10] * 8, available, 100)
+    assert set(idle) == {"rollout:1", "rollout:2"}
+    fast.reserve(
+        {"rollout:1": 0, "rollout:2": 1},
+        {"rollout:1": 32, "rollout:2": 32},
+        {"rollout:1": 320, "rollout:2": 320},
+        100,
+    )
+    assert fast.assign([1] * 8, [10] * 8, available, 100).count("rollout:0") == 7
+    fast.complete("rollout:1", 0, 100.1)
+    fast.complete("rollout:2", 1, 100.1)
+    assert fast.assign([1] * 8, [10] * 8, available, 100.1) == idle
+
+    collector = ShardCollector()
+    collector.setup(
+        ChannelContext(
+            name="profiled",
+            options={
+                "topology": ShardTopology(
+                    "env", (0,), 1, {c: frozenset() for c in available}
+                ),
+                "router": router(1e9),
+            },
+        )
+    )
+    sources = [TrajectorySource(TrajectoryKey(0, 0, 0, 0, 1), 8)]
+    state = torch.arange(8).reshape(-1, 1)
+    item = PolicyInput(
+        obs={"state": state},
+        sources=sources,
+        env_parts=[EnvPart(sources=sources, transition=EnvTransition(rewards=state))],
+    )
+    calls = [d.payload for _, d in collector.collect(item, "input")]
+    assert len(calls) == 2
+    # Alternating destinations leave disjoint offsets from the same env on a GPU.
+    assert any(len(call.policy_input.sources) > 1 for call in calls)
+    returned = []
+    for call in reversed(calls):
+        policy = call.policy_input
+        torch.testing.assert_close(
+            torch.cat([p.transition.rewards for p in policy.env_parts]),
+            policy.obs["state"],
+        )
+        returned.extend(
+            collector.collect(
+                ShardResult(call.call_id, policy.obs["state"] * 10), "input"
+            )
+        )
+    assert len(returned) == 1
+    torch.testing.assert_close(returned[0][1].payload, state * 10)
 
 
 def test_default_hooks_pass_items_through_a_single_shared_queue():

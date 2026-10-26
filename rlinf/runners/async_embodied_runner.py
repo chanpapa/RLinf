@@ -107,16 +107,16 @@ class AsyncEmbodiedRunner(AsyncWeightSyncMixin, EmbodiedRunner):
             # The rollout-side loop is unbounded by design. Ensure one service
             # exists and reuse it across every validation cycle.
             self.rollout.ensure_evaluate_service(
-                input_channel=self.rollout_channel,
+                input_channel=self.eval_rollout_channel,
                 output_channel=self.env_channel,
             ).wait()
         env_handle: Handle = self.env.evaluate(
             input_channel=self.env_channel,
-            rollout_channel=self.rollout_channel,
+            rollout_channel=self.eval_rollout_channel,
         )
         if not env_decoupled_mode:
             rollout_handle: Handle = self.rollout.evaluate(
-                input_channel=self.rollout_channel,
+                input_channel=self.eval_rollout_channel,
                 output_channel=self.env_channel,
             )
         env_results = env_handle.wait()

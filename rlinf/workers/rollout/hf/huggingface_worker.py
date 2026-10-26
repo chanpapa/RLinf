@@ -30,6 +30,13 @@ from rlinf.algorithms.rlt import (
 )
 from rlinf.algorithms.rlt.transition import extract_rlt_obs_from_forward_inputs
 from rlinf.config import SupportedModel
+from rlinf.data.schema.embodied_sharding import (
+    INFERENCE_KEY,
+    ShardCall,
+    ShardEpochEnd,
+    ShardResult,
+    sharding_enabled,
+)
 from rlinf.data.schema.embodied_types import (
     EnvPart,
     PolicyInput,
@@ -46,10 +53,13 @@ from rlinf.utils.placement import HybridComponentPlacement
 
 
 class MultiStepRolloutWorker(Worker):
+    enable_sharding = False
+
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
 
         self.cfg = cfg
+        self.enable_sharding = sharding_enabled(cfg)
         self.should_stop = False
 
         self.only_eval = cfg.runner.get("only_eval", False)
@@ -839,6 +849,55 @@ class MultiStepRolloutWorker(Worker):
             split_fn=self._split_actions,
         )
 
+    async def _generate_shards(
+        self, input_channel: Channel, actor_channel: Channel
+    ) -> None:
+        """Consume dynamically routed batches until every env closes its epoch."""
+        next_input = input_channel.get(key=INFERENCE_KEY, async_op=True)
+        while True:
+            delivery = await next_input.async_wait()
+            call = delivery.payload
+            if isinstance(call, ShardEpochEnd):
+                return
+            if not isinstance(call, ShardCall):
+                raise ValueError(f"Expected a RoLink inference call, got {type(call)}")
+            next_input = input_channel.get(key=INFERENCE_KEY, async_op=True)
+            policy_input = self._decompress_policy_input(call.policy_input)
+            actions = None
+            forward_inputs = None
+            if not policy_input.is_last:
+                policy_output = None
+                if policy_input.requires_inference:
+                    actions, result = self._predict_rollout_actions(
+                        policy_input.obs,
+                        rlt_switch_flags=policy_input.rlt_switch_flags,
+                        intervene_requested=policy_input.intervene_flags,
+                    )
+                    forward_inputs = result.get("forward_inputs")
+                    policy_output = self._build_policy_output(actions, result)
+                else:
+                    actions = policy_input.external_actions
+                actor_channel.put(
+                    PolicyPart(
+                        sources=policy_input.sources,
+                        obs=policy_input.obs if self.collect_raw_transition_obs else {},
+                        output=policy_output,
+                        external_actions=actions
+                        if not policy_input.requires_inference
+                        else None,
+                    ),
+                    async_op=True,
+                )
+            self._publish_env_parts(policy_input, forward_inputs, actor_channel)
+            if actions is not None:
+                actions = actions.detach().cpu().contiguous()
+            # Releasing a shared GPU must include terminal forwards as well.
+            if self.has_accelerator:
+                self.torch_platform.synchronize()
+            await input_channel.put(
+                ShardResult(call.call_id, actions), async_op=True
+            ).async_wait()
+
     @Worker.timer("generate_one_epoch")
     async def generate_one_epoch(
         self,
@@ -847,6 +906,9 @@ class MultiStepRolloutWorker(Worker):
         actor_channel: Channel,
     ) -> None:
         self.update_dagger_beta()
+        if self.enable_sharding:
+            await self._generate_shards(input_channel, actor_channel)
+            return
         for _ in range(self.n_train_chunk_steps):
             for stage_id in range(self.num_pipeline_stages):
                 policy_input, split_sizes = await self._receive_policy_input(
