@@ -1,0 +1,13 @@
+defaults:
+- rolink
+- _self_
+cluster:
+  component_placement:
+    rollout:
+      node_group: edge
+      placement: 0-3
+runner:
+  rolink:
+    enable_sharding: false
+  logger:
+    log_path: ./logs/baseline

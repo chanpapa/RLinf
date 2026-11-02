@@ -1,0 +1,247 @@
+diff --git a/rlinf/runners/embodied_runner.py b/rlinf/runners/embodied_runner.py
+--- a/rlinf/runners/embodied_runner.py
++++ b/rlinf/runners/embodied_runner.py
+@@ -27,7 +27,6 @@
+     sharding_enabled,
+ )
+ from rlinf.data.schema.embodied_trajectory import (
+-    select_trajectory_collector,
+     select_trajectory_dispatcher,
+ )
+ from rlinf.scheduler import Channel
+@@ -100,21 +99,28 @@
+         )
+ 
+         # Data channels
++        if (
++            sharding_enabled(cfg)
++            or cfg.runner.get("use_training_pipeline", False)
++            or cfg.runner.get("enable_decoupled_mode", False)
++        ):
++            raise ValueError(
++                "The env-buffered baseline requires static routing without "
++                "training pipeline or decoupled mode."
++            )
+         self.env_channel = Channel.create("Env")
+         self.eval_rollout_channel = Channel.create("Rollout")
+         if sharding_enabled(cfg):
+             self.rollout_channel = create_shard_channel(cfg, env, rollout)
+         else:
+             self.rollout_channel = self.eval_rollout_channel
+-        # Trajectory assembly runs on the channel worker, so neither the env
+-        # nor the rollout worker has to hold partial trajectory state.
++        # Env workers upload complete trajectories to the actor channel.
+         self.actor_channel = Channel.create(
+             "Actor",
+             node_rank=self.cfg.runner.get("trajectory_channel_node_rank"),
+-            collector=select_trajectory_collector(self.cfg),
+             dispatcher=select_trajectory_dispatcher(self.cfg),
+             cfg=self.cfg,
+-            producers=[self.rollout],
++            producers=[self.env],
+             consumers=[self.actor],
+         )
+         if self.reward is not None:
+@@ -525,11 +531,12 @@
+                         input_channel=self.env_channel,
+                         rollout_channel=self.rollout_channel,
+                         reward_channel=self.reward_channel,
++                        actor_channel=self.actor_channel,
+                     )
+                     rollout_handle: Handle = self.rollout.generate(
+                         input_channel=self.rollout_channel,
+                         output_channel=self.env_channel,
+-                        actor_channel=self.actor_channel,
++                        actor_channel=self.env_channel,
+                     )
+                     reward_handle = None
+                     if self.reward is not None:
+diff --git a/rlinf/workers/env/env_worker.py b/rlinf/workers/env/env_worker.py
+--- a/rlinf/workers/env/env_worker.py
++++ b/rlinf/workers/env/env_worker.py
+@@ -26,6 +26,7 @@
+     action_key,
+     sharding_enabled,
+ )
++from rlinf.data.schema.embodied_trajectory import TrajectoryCollector
+ from rlinf.data.schema.embodied_types import (
+     EnvOutput,
+     EnvPart,
+@@ -39,6 +40,7 @@
+ from rlinf.envs.utils import get_env_attr
+ from rlinf.envs.wrappers import InsertDelay, RecordVideo
+ from rlinf.scheduler import Channel, Cluster, Worker
++from rlinf.scheduler.channel import ChannelContext
+ from rlinf.utils.env_helpers import HistoryManager, SmoothInterveneController
+ from rlinf.utils.nested_dict_process import (
+     clone_nested_to_cpu,
+@@ -76,6 +78,9 @@
+         self.last_intervened_info_list = []
+         self._prefetched_train_bootstrap: list[EnvOutput] | None = None
+         self._trajectory_step = 0
++        self._trajectory_collector = TrajectoryCollector()
++        self._trajectory_collector.setup(ChannelContext(name="Env", cfg=cfg))
++        self._completed_trajectories = []
+         self._component_placement = HybridComponentPlacement(cfg, Cluster())
+ 
+         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
+@@ -1212,6 +1217,16 @@
+                     )
+                     if env_part is not None:
+                         final_env_parts[stage_id] = env_part
++                    await self._collect_trajectory_chunk(
++                        input_channel,
++                        TrajectoryKey(
++                            self._trajectory_step,
++                            epoch,
++                            self._rank,
++                            stage_id,
++                            chunk_step_idx,
++                        ),
++                    )
+                     if (
+                         get_env_attr(self.env_list[stage_id], "insert_delay_metrics")
+                         is not None
+@@ -1257,6 +1272,7 @@
+         input_channel: Channel,
+         rollout_channel: Channel,
+         reward_channel: Channel | None,
++        actor_channel: Channel,
+     ):
+         env_metrics = await self._run_interact_once(
+             input_channel,
+@@ -1264,12 +1280,38 @@
+             reward_channel,
+             cooperative_yield=False,
+         )
++        await self._send_rollout_trajectories(actor_channel)
+ 
+         for env in self.env_list:
+             if self.train_enable_offload:
+                 get_env_attr(env, "offload")()
+ 
+         return env_metrics
++
++    async def _collect_trajectory_chunk(
++        self, channel: Channel, key: TrajectoryKey
++    ) -> None:
++        """Join the policy and environment fragments for this env's chunk."""
++        received = 0
++        while received < 2 * self.train_num_envs_per_stage:
++            part = await channel.get(
++                key=("trajectory", key), async_op=True
++            ).async_wait()
++            received += sum(source.size for source in part.sources)
++            self._completed_trajectories.extend(
++                self._trajectory_collector.collect(part, "trajectory")
++            )
++
++    @Worker.timer("env/send_rollout_trajectories")
++    async def _send_rollout_trajectories(self, channel: Channel) -> None:
++        """Upload the complete rollout after all env stages and epochs finish."""
++        works = [
++            channel.put(trajectory, key=key, async_op=True)
++            for key, trajectory in self._completed_trajectories
++        ]
++        for work in works:
++            await work.async_wait()
++        self._completed_trajectories.clear()
+ 
+     @Worker.timer("evaluate")
+     def evaluate(self, input_channel: Channel, rollout_channel: Channel):
+diff --git a/rlinf/workers/rollout/hf/huggingface_worker.py b/rlinf/workers/rollout/hf/huggingface_worker.py
+--- a/rlinf/workers/rollout/hf/huggingface_worker.py
++++ b/rlinf/workers/rollout/hf/huggingface_worker.py
+@@ -757,15 +757,25 @@
+                 next_rlt_obs = extract_rlt_obs_from_forward_inputs(
+                     result.get("forward_inputs"), transition=True
+                 )
+-        # Republish environment-owned data here to keep one Actor-channel writer.
+-        actor_channel.put(
++        self._return_trajectory_part(
+             env_part.complete(
+                 next_obs=(next_obs if self.collect_raw_transition_obs else None),
+                 next_rlt_obs=next_rlt_obs if self.enable_rlt else None,
+                 final_prev_values=final_prev_values,
+             ),
+-            async_op=True,
+-        )
++            actor_channel,
++        )
++
++    @staticmethod
++    def _return_trajectory_part(part: PolicyPart | EnvPart, channel: Channel) -> None:
++        """Return training data to the env that owns each source fragment."""
++        fragments = [part] if len(part.sources) == 1 else part.split()
++        for fragment in fragments:
++            channel.put(
++                fragment,
++                key=("trajectory", fragment.sources[0].key),
++                async_op=True,
++            )
+ 
+     def _publish_env_parts(
+         self,
+@@ -950,9 +960,7 @@
+                         obs=transition_obs,
+                         output=policy_output,
+                     )
+-                # Publish model-owned data immediately; its environment half
+-                # arrives later through an EnvPart with the same key.
+-                actor_channel.put(trajectory_part, async_op=True)
++                self._return_trajectory_part(trajectory_part, actor_channel)
+                 # Attached parts close previously executed chunks.
+                 self._publish_env_parts(policy_input, forward_inputs, actor_channel)
+ 
+diff --git a/rlinf/runners/async_ppo_embodied_runner.py b/rlinf/runners/async_ppo_embodied_runner.py
+--- a/rlinf/runners/async_ppo_embodied_runner.py
++++ b/rlinf/runners/async_ppo_embodied_runner.py
+@@ -117,11 +117,12 @@
+             rollout_channel=self.rollout_channel,
+             reward_channel=self.reward_channel,
+             metric_channel=self.env_metric_channel,
++            actor_channel=self.actor_channel,
+         )
+         rollout_handle: Handle = self.rollout.generate(
+             input_channel=self.rollout_channel,
+             output_channel=self.env_channel,
+-            actor_channel=self.actor_channel,
++            actor_channel=self.env_channel,
+             metric_channel=self.rollout_metric_channel,
+         )
+ 
+diff --git a/rlinf/workers/env/async_env_worker.py b/rlinf/workers/env/async_env_worker.py
+--- a/rlinf/workers/env/async_env_worker.py
++++ b/rlinf/workers/env/async_env_worker.py
+@@ -35,6 +35,7 @@
+         rollout_channel: Channel,
+         reward_channel: Channel | None,
+         metric_channel: Channel,
++        actor_channel: Channel,
+     ):
+         assert self._interact_task is None or self._interact_task.done(), (
+             "Previous interact task is still running while a new interact call is made."
+@@ -45,6 +46,7 @@
+                 rollout_channel,
+                 reward_channel,
+                 metric_channel,
++                actor_channel,
+             )
+         )
+         try:
+@@ -58,6 +60,7 @@
+         rollout_channel: Channel,
+         reward_channel: Channel | None,
+         metric_channel: Channel,
++        actor_channel: Channel,
+     ):
+         while True:
+             env_metrics = await self._run_interact_once(
+@@ -66,6 +69,7 @@
+                 reward_channel,
+                 cooperative_yield=True,
+             )
++            await self._send_rollout_trajectories(actor_channel)
+ 
+             env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
+             env_interact_time_metrics = self.pop_execution_times()
