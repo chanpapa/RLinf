@@ -205,15 +205,44 @@ class TrajectoryCollector(Collector):
             TrajectoryMode.LEROBOT: LerobotOutput,
         }
         self._output = output_types[self.plan.mode](ctx.cfg, self.plan.geometry)
+        self._pending_chunks: dict[CollectionScope, dict[int, JoinedChunk]] = {}
+        self._next_chunk: dict[CollectionScope, int] = {}
+        self._chunks_per_step = (
+            ctx.cfg.env.train.rollout_epoch * self.plan.geometry.chunk_count
+        )
 
     def collect(self, item: Any, key: str) -> Iterable[CollectedItem]:
         """Accept one part and yield any actor outputs it completes."""
         del key
         for chunk in self._joiner.push(item):
-            # Commit join state only after accumulation/materialization succeeds.
-            outputs = list(self._output.emit(chunk))
-            self._joiner.acknowledge(chunk.key)
-            yield from outputs
+            scope = (chunk.key.step_id, *chunk.source)
+            index = (
+                chunk.key.epoch_id * self.plan.geometry.chunk_count + chunk.key.chunk_id
+            )
+            chunk_count = self._chunks_per_step
+            if self.plan.mode is TrajectoryMode.PIPELINE:
+                scope = (*scope, chunk.key.epoch_id)
+                index = chunk.key.chunk_id
+                chunk_count = self.plan.geometry.chunk_count
+            next_index = self._next_chunk.get(scope, 0)
+            if index < next_index:
+                raise ValueError(
+                    f"Received duplicate trajectory event for {chunk.key}."
+                )
+            pending = self._pending_chunks.setdefault(scope, {})
+            pending[index] = chunk
+            # Different rollout workers can finish adjacent chunks out of order.
+            while next_index in pending:
+                ready = pending[next_index]
+                outputs = list(self._output.emit(ready))
+                self._joiner.acknowledge(ready.key)
+                del pending[next_index]
+                next_index += 1
+                self._next_chunk[scope] = next_index
+                yield from outputs
+            if next_index == chunk_count:
+                del self._pending_chunks[scope]
+                del self._next_chunk[scope]
 
 
 def select_trajectory_collector(cfg: DictConfig) -> type[TrajectoryCollector]:

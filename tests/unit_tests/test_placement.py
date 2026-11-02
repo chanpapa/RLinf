@@ -42,6 +42,101 @@ from util import init_global_config  # noqa: E402
 from workflow import Workflow, traverse_st_cuts  # noqa: E402
 
 
+def test_rolink_profile_search_exports_runtime_placement(tmp_path, monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from rlinf.data.schema.embodied_routing import LoadAwareRouter
+    from rlinf.scheduler import WorkerAddress
+    from toolkits.auto_placement.rolink import export_config, search
+
+    profile = (
+        Path(__file__).resolve().parents[2]
+        / "examples/embodiment/config/rolink_openpi_profile.json"
+    )
+    from hydra import compose, initialize_config_dir
+
+    monkeypatch.setenv("EMBODIED_PATH", str(profile.parent.parent))
+    with initialize_config_dir(version_base=None, config_dir=str(profile.parent)):
+        cfg = compose(config_name="maniskill_ppo_openpi_rolink")
+    cfg.env.train.total_num_envs = cfg.env.eval.total_num_envs = 8
+    cfg.env.train.max_steps_per_rollout_epoch = 8
+    cfg.actor.model.num_action_chunks = 2
+    cfg.actor.global_batch_size = 32
+    cfg.actor.micro_batch_size = 1
+    kwargs = {
+        "edge_gpus": 4,
+        "cloud_gpus": 4,
+        "env_workers": (2,),
+        "queue_sizes": (1, 2),
+    }
+    plans = search(cfg, profile, mode="async", **kwargs)
+    assert plans and all(p.actor_gpus + p.cloud_rollout_gpus == 4 for p in plans)
+    assert all(sum(p.rollout_samples_per_cycle) == 8 for p in plans)
+    best = plans[0]
+    assert best.predicted_s == max(best.data_ready_s, best.actor_s + best.weight_sync_s)
+    sync_plans = search(cfg, profile, mode="sync", **kwargs)
+    assert all(
+        p.actor_gpus == 4
+        and p.predicted_s == pytest.approx(p.data_ready_s + p.actor_s + p.weight_sync_s)
+        for p in sync_plans
+    )
+
+    snapshot = OmegaConf.to_container(cfg)
+    output = tmp_path / "selected.yaml"
+    export_config(cfg, best, profile, 4, output)
+    assert OmegaConf.to_container(cfg) == snapshot
+    selected = OmegaConf.load(output)
+    cluster = create_fake_cluster(
+        num_nodes=2,
+        accelerators_per_node=4,
+        extra_group_mapping={"edge": [0], "cloud": [1]},
+    )
+    placement = HybridComponentPlacement(selected, cluster)
+    assert placement.get_world_size("env") == best.env_workers
+    assert placement.get_world_size("actor") == best.actor_gpus
+    assert (
+        placement.get_world_size("rollout")
+        == best.edge_rollout_gpus + best.cloud_rollout_gpus
+    )
+    infos = [
+        SimpleNamespace(
+            address=WorkerAddress("rollout", i),
+            cluster_node_rank=p.cluster_node_rank,
+            accelerator_model="test",
+        )
+        for i, p in enumerate(placement.get_strategy("rollout").get_placement(cluster))
+    ]
+    router = LoadAwareRouter.from_config(
+        selected.runner.rolink, selected.cluster.network, infos, 0
+    )
+    assert selected.runner.rolink.max_env_requests == best.max_env_requests
+    assert all(
+        p.max_batch_size
+        == (
+            best.edge_batch_cap
+            if router.rollout_sites[c] == "edge"
+            else best.cloud_batch_cap
+        )
+        for c, p in router.profiles.items()
+    )
+    actor_devices = {
+        (p.cluster_node_rank, p.local_accelerator_rank)
+        for p in placement.get_strategy("actor").get_placement(cluster)
+    }
+    assert actor_devices.isdisjoint(
+        (p.cluster_node_rank, p.local_accelerator_rank)
+        for p in placement.get_strategy("rollout").get_placement(cluster)
+    )
+
+    cfg.env.train.requires_gpu = False
+    cpu_plan = search(cfg, profile, env_step_s=0.25, **kwargs)[0]
+    export_config(cfg, cpu_plan, profile, 4, output)
+    cpu_placement = HybridComponentPlacement(OmegaConf.load(output), cluster)
+    assert isinstance(cpu_placement.get_strategy("env"), NodePlacementStrategy)
+    assert cpu_placement.get_world_size("env") == 2
+
+
 class FakeCluster:
     """Minimal Cluster stub exposing just the APIs placement strategies rely on."""
 

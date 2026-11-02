@@ -57,6 +57,7 @@ from rlinf.utils.utils import (
     clear_memory,
     get_loss_agg_func,
     masked_mean,
+    seed_everything,
 )
 
 
@@ -114,6 +115,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         Initialize the actor worker. build the model and use corresponding training backend,
         if needed, offload model parameters and optimizer states to CPU.
         """
+        seed_everything(self.cfg.actor.seed)
         self.setup_model_and_optimizer()
 
         if self.enable_offload:

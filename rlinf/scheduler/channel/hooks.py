@@ -107,6 +107,14 @@ class Collector:
         """
         yield key, item
 
+    def next_flush_at(self) -> float | None:
+        """Return the next flush deadline on the monotonic clock, or None."""
+        return None
+
+    def flush(self) -> Iterable[tuple[str, Any]]:
+        """Emit buffered items when the scheduled deadline expires."""
+        return ()
+
 
 class Dispatcher:
     """Decide which consumer receives each item.

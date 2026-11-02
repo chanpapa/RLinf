@@ -22,6 +22,10 @@ from typing import TYPE_CHECKING, Union
 
 from omegaconf.dictconfig import DictConfig
 
+from rlinf.data.schema.embodied_sharding import (
+    create_shard_channel,
+    sharding_enabled,
+)
 from rlinf.data.schema.embodied_trajectory import (
     select_trajectory_collector,
     select_trajectory_dispatcher,
@@ -97,11 +101,16 @@ class EmbodiedRunner:
 
         # Data channels
         self.env_channel = Channel.create("Env")
-        self.rollout_channel = Channel.create("Rollout")
+        self.eval_rollout_channel = Channel.create("Rollout")
+        if sharding_enabled(cfg):
+            self.rollout_channel = create_shard_channel(cfg, env, rollout)
+        else:
+            self.rollout_channel = self.eval_rollout_channel
         # Trajectory assembly runs on the channel worker, so neither the env
         # nor the rollout worker has to hold partial trajectory state.
         self.actor_channel = Channel.create(
             "Actor",
+            node_rank=self.cfg.runner.get("trajectory_channel_node_rank"),
             collector=select_trajectory_collector(self.cfg),
             dispatcher=select_trajectory_dispatcher(self.cfg),
             cfg=self.cfg,
@@ -206,10 +215,10 @@ class EmbodiedRunner:
     def evaluate(self):
         env_handle: Handle = self.env.evaluate(
             input_channel=self.env_channel,
-            rollout_channel=self.rollout_channel,
+            rollout_channel=self.eval_rollout_channel,
         )
         rollout_handle: Handle = self.rollout.evaluate(
-            input_channel=self.rollout_channel,
+            input_channel=self.eval_rollout_channel,
             output_channel=self.env_channel,
         )
         env_results = env_handle.wait()
